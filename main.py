@@ -1,9 +1,8 @@
 import os
-import time
-from datetime import datetime
+import asyncio
 
 import pandas as pd
-import requests
+import aiohttp
 
 BASE_URL = 'https://jewelers.services/productcore/api/'
 BASE_MEDIA_URL = 'https://images.jewelers.services'
@@ -19,7 +18,7 @@ HEADERS = {
 }
 
 
-def get_urls(url, headers, category):
+async def get_urls(session, url, headers, category):
     """
     Возвращает список эндпоинтов каждого товара на странице.
     """
@@ -29,8 +28,8 @@ def get_urls(url, headers, category):
         "sortCode": 28420,
         "path": f"{category}"
     }
-    response = requests.post(url, headers=headers, json=body)
-    src = response.json()
+    async with session.post(url, headers=headers, json=body) as response:
+        src = await response.json()
 
     return [
         f"{BASE_URL}pd/{item.get('URLDescription')}/{item.get('Style')}"
@@ -38,32 +37,36 @@ def get_urls(url, headers, category):
     ]
 
 
-def get_data(url, headers):
+async def get_data(session, url, headers):
     """Получает и возвращает данные по указанному URL-адресу в формате JSON"""
     try:
-        with requests.Session() as session:
-            response = session.get(url, headers=headers)
+        async with session.get(url, headers=headers, ssl=False,
+                               timeout=30) as response:
             response.raise_for_status()
-            return response.json()
-    except requests.exceptions.RequestException as e:
+            return await response.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         print(f"Не удалось получить данные по адресу {url}: {str(e)}")
         return None
 
 
-def get_specification(url, headers, category):
-    data_table = []
-    for item_url in get_urls(url, headers, category):
+async def get_specification(session, url, headers, category):
+    """
+    Получает необходимые данные для каждого товара по его URL, компонует все
+    данные в список
+    """
+    products_data = []
+    urls = await get_urls(session, url, headers, category)
+    for item_url in urls:
         print(f"Получение данных по адресу: {item_url}")
-        data = get_data(item_url, headers)
+        data = await get_data(session, item_url, headers)
         if data:
             description = {}
             product = data.get("Product")
             if product:
                 description["Product"] = product["Style"]
-                description["CountryOfOrigin"] = product[
-                    "CountryOfOrigin"]
-                description["Product availability"] = "In Stock" if \
-                    product["InStock"] > 0 else "Out of Stock"
+                description["CountryOfOrigin"] = product["CountryOfOrigin"]
+                description["Product availability"] = "In Stock" if product[
+                                                                        "InStock"] > 0 else "Out of Stock"
             specifications = data.get("Specifications")
             if specifications:
                 description.update(
@@ -77,38 +80,66 @@ def get_specification(url, headers, category):
             images = data.get("Images")
             if images:
                 description["Images"] = {
-                    f"{BASE_MEDIA_URL}/qgrepo/{img.get('FileName')}"
-                    for img in images
-                }
-                video = data.get("Video")
-                if video:
-                    description[
-                        "Video"] = f"{BASE_MEDIA_URL}/0/Videos/{video['FileName']}"
-            data_table.append(description)
-    return data_table
+                    f"{BASE_MEDIA_URL}/qgrepo/{img.get('FileName')}" for img in
+                    images}
+            video = data.get("Video")
+            if video:
+                description[
+                    "Video"] = f"{BASE_MEDIA_URL}/0/Videos/{video['FileName']}"
+            products_data.append(description)
+    return products_data
 
 
-def save_in_excel(data, category):
+async def save_in_excel(data, category):
     """Создание файла .xlsx и заполнение его данными"""
     df = pd.DataFrame(data)
     directory = "./output"
-    os.makedirs(directory, exist_ok=True)
+    if not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
     file_path = os.path.join(directory, f'{category}.xlsx')
-    df.to_excel(file_path, index=False)
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, df.to_excel, file_path)
+    except Exception as e:
+        print(f"Не удалось сохранить данные в файл {file_path}: {str(e)}")
 
 
-def cyclic_parse(url, headers, category, interval):
-    """Выполнение парсинга с заданной периодичностью"""
+async def parse_category(session, url, category):
+    """
+    Выполняет парсинг товаров из указанной категории.
 
-    print("Начало парсинга")
-    data = get_specification(url, headers, category)
-    save_in_excel(data, category)
-    print("Данные сохранены. Ожидание следующего цикла")
+    """
+    data = await get_specification(session, url, HEADERS, category)
+    if data:
+        await save_in_excel(data, category)
+
+
+async def main():
+    """
+    Главная функция, запускает парсинг двух категорий параллельно.
+    """
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for category in CATEGORIES:
+            url = BASE_URL + f"pl/{category}"
+            task = asyncio.create_task(parse_category(session, url, category))
+            tasks.append(task)
+
+        await asyncio.gather(*tasks)
+
+
+async def cyclic_parse():
+    """Выполнение парсинга с заданной в минутах периодичностью"""
+    interval = int(input("Введите периодичность парсинга в минутах: "))
+    while True:
+        print("Начало парсинга")
+        await main()
+        print("Данные сохранены. Ожидание следующего цикла")
+        await asyncio.sleep(interval * 60)
 
 
 if __name__ == '__main__':
-    now = datetime.now()
-    cyclic_parse(BASE_URL + f"pl/{CATEGORIES[0]}", HEADERS, CATEGORIES[0], 1)
-    cyclic_parse(BASE_URL + f"pl/{CATEGORIES[1]}", HEADERS, CATEGORIES[1], 1)
-    end = datetime.now() - now
-    print(end)
+    try:
+        asyncio.run(cyclic_parse())
+    except KeyboardInterrupt:
+        pass
